@@ -1,13 +1,25 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
 #include <cjson/cJSON.h>
 #include "yasdi_handler.h"
 #include "mqtt_client.h"
 #include "log.h"
 
+#define HA_DISCOVERY_PREFIX_ENV "MQTT_DISCOVERY_PREFIX"
+#define HA_DISCOVERY_PREFIX_DEFAULT "homeassistant"
+
 char *get_required_env(const char *name);
 void new_values_cb(struct device_value_t *values);
+void set_request_cb(const char *sn, const char *action, const char *channel, const char *payload);
+void discovery_cb(DWORD device_sn, struct param_channel_info_t *info);
+void publish_discovery(DWORD device_sn);
+
+bool mqtt_set_enabled = false;
+char *ha_discovery_prefix;
+bool mqtt_client_ready = false;
 
 int main(int argc, char **argv)
 {
@@ -22,6 +34,11 @@ int main(int argc, char **argv)
     char *mqtt_ssl_cert = getenv("MQTT_SSL_CERT");
     char *mqtt_user = getenv("MQTT_USER");
     char *mqtt_password = getenv("MQTT_PASSWORD");
+
+    mqtt_set_enabled = getenv("MQTT_SET_ENABLED") != NULL && atoi(getenv("MQTT_SET_ENABLED")) != 0;
+    ha_discovery_prefix = getenv(HA_DISCOVERY_PREFIX_ENV);
+    if (ha_discovery_prefix == NULL)
+        ha_discovery_prefix = HA_DISCOVERY_PREFIX_DEFAULT;
 
     char *mqtt_client_id = "yasdi2mqtt";
     if (getenv("MQTT_CLIENT_ID"))
@@ -51,12 +68,15 @@ int main(int argc, char **argv)
     log_info("Configuration | MQTT_QOS_LEVEL = %d", mqtt_qos_level);
     log_info("Configuration | MQTT_USER = %s", mqtt_user);
     log_info("Configuration | MQTT_PASSWORD = %s", mqtt_password);
+    log_info("Configuration | MQTT_SET_ENABLED = %d", mqtt_set_enabled);
+    log_info("Configuration | HA_DISCOVERY_PREFIX = %s", ha_discovery_prefix);
 
     if (!mqtt_init(mqtt_server, mqtt_port, mqtt_ssl_cert, mqtt_user, mqtt_password, mqtt_topic_prefix, mqtt_qos_level, mqtt_client_id))
     {
         log_fatal("Unable to initialize mqtt_client");
         return -1;
     }
+    mqtt_client_ready = true;
 
     if (!yh_init(yasdi_config, yasdi_max_device_count, yasdi_update_interval))
     {
@@ -65,6 +85,7 @@ int main(int argc, char **argv)
     }
 
     yh_new_values_cb = new_values_cb;
+    mc_set_request_cb = set_request_cb;
     yh_loop();
 
     return 0;
@@ -89,4 +110,114 @@ void new_values_cb(struct device_value_t *values)
 
     mqtt_send(topic, json);
     free(json);
+
+    // Publish HA discovery entities for the parameter channels (once per device)
+    publish_discovery(values->device_sn);
+}
+
+void set_request_cb(const char *sn, const char *action, const char *channel, const char *payload)
+{
+    char topic[160];
+    char result[MAX_VALUE_STR_SIZE * 2];
+
+    DWORD device_sn = strtoul(sn, NULL, 10);
+
+    if (!mqtt_set_enabled)
+    {
+        log_warn("Ignoring %s request for %s/%s: parameter writes are disabled (set MQTT_SET_ENABLED=1 to enable)", action, sn, channel);
+        snprintf(topic, sizeof(topic), "%s/result/%s", sn, channel);
+        snprintf(result, sizeof(result), "ERROR: parameter writes are disabled (MQTT_SET_ENABLED)");
+        mqtt_send(topic, result);
+        return;
+    }
+
+    if (strcmp(action, "set") == 0)
+    {
+        bool ok = yh_set_value(device_sn, channel, payload);
+        snprintf(topic, sizeof(topic), "%s/result/%s", sn, channel);
+        snprintf(result, sizeof(result), ok ? "OK" : "ERROR: channel was not written (see logs for status)");
+        mqtt_send(topic, result);
+    }
+    else if (strcmp(action, "get") == 0)
+    {
+        char value[MAX_VALUE_STR_SIZE];
+        bool ok = yh_get_param_value(device_sn, channel, value, sizeof(value));
+        snprintf(topic, sizeof(topic), "%s/get/%s", sn, channel);
+        if (ok)
+            snprintf(result, sizeof(result), "%s", value);
+        else
+            snprintf(result, sizeof(result), "ERROR: unable to read channel");
+        mqtt_send(topic, result);
+    }
+    else
+    {
+        log_warn("Ignoring unknown action '%s' for %s/%s", action, sn, channel);
+        snprintf(topic, sizeof(topic), "%s/result/%s", sn, channel);
+        snprintf(result, sizeof(result), "ERROR: unknown action '%s'", action);
+        mqtt_send(topic, result);
+    }
+}
+
+void publish_discovery(DWORD device_sn)
+{
+    static DWORD discovered[16] = {0};
+    for (unsigned int i = 0; i < sizeof(discovered) / sizeof(discovered[0]); i++)
+    {
+        if (discovered[i] == 0)
+        {
+            discovered[i] = device_sn;
+            break;
+        }
+        if (discovered[i] == device_sn)
+            return; // already published
+    }
+
+    yh_foreach_param_channel(device_sn, discovery_cb);
+}
+
+void discovery_cb(DWORD device_sn, struct param_channel_info_t *info)
+{
+    const char *component = "text";
+    cJSON *config = cJSON_CreateObject();
+    char object_id[64], node_id[32], state_topic[128], command_topic[128];
+    char topic[192];
+
+    snprintf(node_id, sizeof(node_id), "yasdi2mqtt_%lu", (unsigned long)device_sn);
+    snprintf(object_id, sizeof(object_id), "%s_%s", node_id, info->name);
+    snprintf(state_topic, sizeof(state_topic), "%lu/get/%s", (unsigned long)device_sn, info->name);
+    snprintf(command_topic, sizeof(command_topic), "%lu/set/%s", (unsigned long)device_sn, info->name);
+
+    cJSON_AddStringToObject(config, "name", info->name);
+    cJSON_AddStringToObject(config, "state_topic", state_topic);
+    cJSON_AddStringToObject(config, "object_id", object_id);
+    cJSON_AddStringToObject(config, "unique_id", object_id);
+
+    if (info->stat_text_cnt > 0)
+    {
+        // Enum-type parameter -> select with the status texts as options
+        component = "select";
+        cJSON *options = cJSON_CreateArray();
+        for (int i = 0; i < info->stat_text_cnt; i++)
+            cJSON_AddItemToArray(options, cJSON_CreateString(info->stat_texts[i]));
+        cJSON_AddItemToObject(config, "options", options);
+        cJSON_AddStringToObject(config, "command_topic", command_topic);
+    }
+    else
+    {
+        // Numeric parameter -> number entity, everything else -> text entity
+        component = "number";
+        cJSON_AddStringToObject(config, "command_topic", command_topic);
+        cJSON_AddNumberToObject(config, "step", 0.1);
+        if (info->unit[0] != '\0' && strcmp(info->unit, "---") != 0)
+            cJSON_AddStringToObject(config, "unit_of_measurement", info->unit);
+    }
+
+    char *payload = cJSON_PrintUnformatted(config);
+    snprintf(topic, sizeof(topic), "%s/%s/%s/%s/config", ha_discovery_prefix, component, node_id, object_id);
+    if (mqtt_client_ready)
+        mqtt_send_raw(topic, payload, true);
+    else
+        log_warn("Skipping discovery publish for %s: mqtt not ready", info->name);
+    free(payload);
+    cJSON_Delete(config);
 }

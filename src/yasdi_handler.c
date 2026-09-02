@@ -9,19 +9,26 @@
 
 #define MAX_DRIVER_COUNT 128
 #define MAX_CHANNEL_COUNT 300
-#define MAX_VALUE_STR_SIZE 10
-#define MAX_CHANNEL_NAME_SIZE 20
+#include <pthread.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#define PARAM_CACHE_FMT "%s/%lu.channels.txt"
+#define MAX_STAT_TEXT_COUNT 8
 
 DWORD driver_count;
 DWORD drivers[MAX_DRIVER_COUNT];
 DWORD max_device_count;
 DWORD *active_devices;
 unsigned int update_interval;
+char *cache_dir;
 
 void (*yh_new_values_cb)(struct device_value_t *);
 
 struct device_value_t **yh_get_values();
 void device_detection_cb(TYASDIDetectionSub event, DWORD device);
+
+static pthread_mutex_t yasdi_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Initializes yasdiMaster, enables the driver and prepares for device detection. Must be called first.
@@ -35,6 +42,7 @@ bool yh_init(const char *ini_file, DWORD device_count, unsigned int device_updat
     int status;
     max_device_count = device_count;
     update_interval = device_update_interval;
+    cache_dir = getenv("YASDI_CACHE_DIR");
 
     status = yasdiMasterInitialize(ini_file, &driver_count);
     if (status != 0)
@@ -128,7 +136,9 @@ void yh_loop()
         }
 
         // Collect inverter data and call cb for each
+        pthread_mutex_lock(&yasdi_mutex);
         struct device_value_t **values = yh_get_values();
+        pthread_mutex_unlock(&yasdi_mutex);
         for (DWORD i = 0; i < max_device_count; i++)
         {
             struct device_value_t *value = values[i];
@@ -311,5 +321,255 @@ void device_detection_cb(TYASDIDetectionSub event, DWORD device)
         break;
     default:
         log_warn("Got invalid event (device: %u) for device_detection_cb: %d", device, event);
+    }
+}
+/*
+ * Installer-level access ('inst') is required for parameter writes.
+ * Password scheme (same as yasdishell): "ID00<day + month + last 2 digits of year>"
+ */
+void yh_ensure_auth()
+{
+    static bool authenticated = false;
+    if (authenticated)
+        return;
+
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+    int datesum = lt->tm_mday + (lt->tm_mon + 1) + (lt->tm_year % 100);
+
+    char passwd[12];
+    snprintf(passwd, sizeof(passwd), "ID00%d", datesum);
+
+    if (yasdiMasterSetAccessLevel("inst", passwd))
+    {
+        authenticated = true;
+        log_info("Authenticated at installer level (password: %s)", passwd);
+    }
+    else
+    {
+        log_warn("Unable to authenticate at installer level (password: %s)", passwd);
+    }
+}
+
+/* Build path of the channel cache file for a device sn. */
+static void channel_cache_path(DWORD device_sn, char *path, size_t size)
+{
+    snprintf(path, size, PARAM_CACHE_FMT, cache_dir, (unsigned long)device_sn);
+}
+
+/*
+ * Try to resolve a parameter channel handle from the on-disk cache file.
+ * Returns 0 if the channel was not found (or cache disabled/missing).
+ */
+static DWORD find_param_channel_cached(DWORD device_sn, const char *channel_name)
+{
+    if (cache_dir == NULL)
+        return 0;
+
+    char path[256];
+    channel_cache_path(device_sn, path, sizeof(path));
+
+    FILE *file = fopen(path, "r");
+    if (file == NULL)
+        return 0;
+
+    char line[128], name[MAX_CHANNEL_NAME_SIZE];
+    unsigned long handle;
+    DWORD found = 0;
+    while (fgets(line, sizeof(line), file))
+    {
+        if (sscanf(line, "%lu %19[^\n\r]", &handle, name) == 2 && strcmp(name, channel_name) == 0)
+        {
+            found = (DWORD)handle;
+            break;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+/* Write all parameter channel handles/names of a device to the cache file. */
+static void write_param_channel_cache(DWORD device, DWORD device_sn)
+{
+    if (cache_dir == NULL)
+        return;
+
+    char path[256];
+    channel_cache_path(device_sn, path, sizeof(path));
+
+    FILE *file = fopen(path, "w");
+    if (file == NULL)
+    {
+        log_warn("Unable to write channel cache file: %s", path);
+        return;
+    }
+
+    DWORD channels[MAX_CHANNEL_COUNT];
+    DWORD channel_count = GetChannelHandlesEx(device, channels, MAX_CHANNEL_COUNT, PARAMCHANNELS);
+    for (DWORD i = 0; i < channel_count; i++)
+    {
+        char name[MAX_CHANNEL_NAME_SIZE];
+        if (GetChannelName(channels[i], name, sizeof(name)) == YE_OK)
+            fprintf(file, "%lu %s\n", (unsigned long)channels[i], name);
+    }
+    fclose(file);
+    log_debug("Cached %u parameter channels of device %lu to %s", channel_count, (unsigned long)device_sn, path);
+}
+
+/*
+ * Resolve a parameter channel handle by name. Uses the cache file if available,
+ * otherwise enumerates PARAMCHANNELS from the device and populates the cache.
+ */
+static DWORD find_param_channel(DWORD device, DWORD device_sn, const char *channel_name)
+{
+    DWORD channel = find_param_channel_cached(device_sn, channel_name);
+    if (channel != 0)
+        return channel;
+
+    DWORD channels[MAX_CHANNEL_COUNT];
+    DWORD channel_count = GetChannelHandlesEx(device, channels, MAX_CHANNEL_COUNT, PARAMCHANNELS);
+    if (channel_count == 0)
+        return 0;
+
+    write_param_channel_cache(device, device_sn);
+
+    for (DWORD i = 0; i < channel_count; i++)
+    {
+        char name[MAX_CHANNEL_NAME_SIZE];
+        if (GetChannelName(channels[i], name, sizeof(name)) == YE_OK && strcmp(name, channel_name) == 0)
+            return channels[i];
+    }
+    return 0;
+}
+
+bool yh_set_value(DWORD device_sn, const char *channel_name, const char *value_str)
+{
+    if (channel_name == NULL || value_str == NULL || value_str[0] == '\0')
+        return false;
+
+    pthread_mutex_lock(&yasdi_mutex);
+
+    DWORD device = FindDeviceSN(device_sn);
+    if (device == 0)
+    {
+        log_error("Unable to find device with sn %lu", (unsigned long)device_sn);
+        pthread_mutex_unlock(&yasdi_mutex);
+        return false;
+    }
+
+    DWORD channel = find_param_channel(device, device_sn, channel_name);
+    if (channel == 0)
+    {
+        log_error("Unable to find parameter channel '%s' for device %lu", channel_name, (unsigned long)device_sn);
+        pthread_mutex_unlock(&yasdi_mutex);
+        return false;
+    }
+
+    yh_ensure_auth();
+
+    // Auto-detect value type: numeric payload -> double setter, else string setter
+    char *end;
+    double dbl_value = strtod(value_str, &end);
+    bool numeric = (end != value_str && *end == '\0');
+
+    int status = numeric ? SetChannelValue(channel, device, dbl_value)
+                         : SetChannelValueString(channel, device, value_str);
+
+    // Retry once with fresh authentication on access-rights errors (-5)
+    if (status == -5)
+    {
+        log_debug("Write to %s failed with access-rights error, re-authenticating...", channel_name);
+        yh_ensure_auth();
+        status = numeric ? SetChannelValue(channel, device, dbl_value)
+                         : SetChannelValueString(channel, device, value_str);
+    }
+
+    pthread_mutex_unlock(&yasdi_mutex);
+
+    if (status != 0)
+        log_error("Unable to write channel '%s' of device %lu: status %d", channel_name, (unsigned long)device_sn, status);
+    else
+        log_info("Channel '%s' of device %lu set to '%s'", channel_name, (unsigned long)device_sn, value_str);
+
+    return status == 0;
+}
+
+bool yh_get_param_value(DWORD device_sn, const char *channel_name, char *value_buf, size_t buf_size)
+{
+    if (channel_name == NULL || value_buf == NULL)
+        return false;
+
+    pthread_mutex_lock(&yasdi_mutex);
+
+    DWORD device = FindDeviceSN(device_sn);
+    if (device == 0)
+    {
+        log_error("Unable to find device with sn %lu", (unsigned long)device_sn);
+        pthread_mutex_unlock(&yasdi_mutex);
+        return false;
+    }
+
+    DWORD channel = find_param_channel(device, device_sn, channel_name);
+    if (channel == 0)
+    {
+        log_error("Unable to find parameter channel '%s' for device %lu", channel_name, (unsigned long)device_sn);
+        pthread_mutex_unlock(&yasdi_mutex);
+        return false;
+    }
+
+    double value;
+    int status = GetChannelValue(channel, device, &value, value_buf, buf_size, 0);
+
+    pthread_mutex_unlock(&yasdi_mutex);
+
+    if (status != YE_OK)
+    {
+        log_error("Unable to read parameter channel '%s' of device %lu: status %d", channel_name, (unsigned long)device_sn, status);
+        return false;
+    }
+
+    // Numeric channels return an empty text buffer -> format the double value
+    if (value_buf[0] == '\0')
+        snprintf(value_buf, buf_size, "%g", value);
+
+    return true;
+}
+
+void yh_foreach_param_channel(DWORD device_sn, yh_param_channel_cb cb)
+{
+    if (cb == NULL)
+        return;
+
+    pthread_mutex_lock(&yasdi_mutex);
+
+    DWORD device = FindDeviceSN(device_sn);
+    if (device == 0)
+    {
+        pthread_mutex_unlock(&yasdi_mutex);
+        return;
+    }
+
+    DWORD channels[MAX_CHANNEL_COUNT];
+    DWORD channel_count = GetChannelHandlesEx(device, channels, MAX_CHANNEL_COUNT, PARAMCHANNELS);
+    if (channel_count > 0)
+        write_param_channel_cache(device, device_sn);
+
+    pthread_mutex_unlock(&yasdi_mutex);
+
+    for (DWORD i = 0; i < channel_count; i++)
+    {
+        struct param_channel_info_t info;
+        memset(&info, 0, sizeof(info));
+
+        if (GetChannelName(channels[i], info.name, sizeof(info.name)) != YE_OK)
+            continue;
+        GetChannelUnit(channels[i], info.unit, sizeof(info.unit));
+
+        int stat_cnt = GetChannelStatTextCnt(channels[i]);
+        info.stat_text_cnt = stat_cnt > MAX_STAT_TEXT_COUNT ? MAX_STAT_TEXT_COUNT : stat_cnt;
+        for (int t = 0; t < info.stat_text_cnt; t++)
+            GetChannelStatText(channels[i], t, info.stat_texts[t], MAX_VALUE_STR_SIZE);
+
+        cb(device_sn, &info);
     }
 }

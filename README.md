@@ -127,7 +127,42 @@ docker run \
 | MQTT_QOS_LEVEL         | *Optional*<br><br>See [here](http://www.steves-internet-guide.com/understanding-mqtt-qos-levels-part-1/) for explanation.                                                     | 2                         |
 | MQTT_USER              | *Optional*                                                                                                                                                                    | johndoe                   |
 | MQTT_PASSWORD          | *Optional*                                                                                                                                                                    | sEcReT                    |
+| MQTT_SET_ENABLED       | *Optional*<br><br>Set to `1` to enable writing parameter channels via MQTT (see [Parameter Read/Write](#parameter-readwrite) below). *Disabled by default.*                    | 0                         |
+| MQTT_DISCOVERY_PREFIX  | *Optional*<br><br>MQTT prefix used for the Home Assistant discovery messages.                                                                                                 | homeassistant             |
 | LOG_LEVEL              | *Optional*<br><br>Set `0` to enable debug output                                                                                                                              | 0                         |
+
+## Parameter Read/Write
+
+Besides publishing spot values, `yasdi2mqtt` can read and write parameter channels of detected devices via MQTT. Writing is disabled by default and has to be enabled by setting `MQTT_SET_ENABLED=1`. When a request is processed, a result is published on the corresponding `result` or `get` topic (`OK` or an error description).
+
+For a device with serial number `<device_sn>` and channel `<channel>` (e.g. `WMaxAstEins`), the following topics are available:
+
+| Topic                                      | Direction | Description                                                                       |
+|--------------------------------------------|-----------|-----------------------------------------------------------------------------------|
+| `$MQTT_TOPIC_PREFIX/<device_sn>/set/<channel>`  | subscribe | Write a new value to the parameter channel (requires `MQTT_SET_ENABLED=1`). Result is published on `$MQTT_TOPIC_PREFIX/<device_sn>/result/<channel>`. |
+| `$MQTT_TOPIC_PREFIX/<device_sn>/get/<channel>`  | subscribe | Request the current value of the parameter channel. Result is published on `$MQTT_TOPIC_PREFIX/<device_sn>/get/<channel>`. |
+
+Example:
+
+```sh
+# Write a value (result will be published on solar/inverter/123456/result/WMaxAstEins)
+mqtt pub -t 'solar/inverter/123456/set/WMaxAstEins' -m '100'
+
+# Read a value (result will be published on solar/inverter/123456/get/WMaxAstEins)
+mqtt pub -t 'solar/inverter/123456/get/WMaxAstEins' -m ''
+```
+
+> Parameter channel lookups and status texts are cached locally (in the `devices` cache directory) to speed up subsequent requests.
+
+### Home Assistant Discovery
+
+If you use Home Assistant with MQTT discovery enabled, `yasdi2mqtt` automatically publishes discovery entries for all detected parameter channels (once per device):
+
+* Channels with status texts become `select` entities
+* Numeric channels become `number` entities (including their unit of measurement, if available)
+* All other channels become `text` entities
+
+State and command topics of these entities map to the `get`/`set` topics described above. The discovery messages are published under `<MQTT_DISCOVERY_PREFIX>/<component>/yasdi2mqtt_<device_sn>/.../config` (default prefix: `homeassistant`).
 
 ## Get Help
 Thanks to a growing community of `yasdi2mqtt` users, there is already plenty of information on the [Discussions](https://github.com/pkwagner/yasdi2mqtt/discussions) tab. If you struggle during setup, please check out existing answers first or feel free to open a new thread. Here's a quick overview over some relevant threads:

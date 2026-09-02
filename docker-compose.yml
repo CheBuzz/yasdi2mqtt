@@ -17,3 +17,5 @@ services:
             MQTT_PORT: 1883
             MQTT_USER: "johndoe"
             MQTT_PASSWORD: "sEcReT"
+            # MQTT_SET_ENABLED: 1
+            # YASDI_CACHE_DIR: "/etc/yasdi2mqtt/devices"
