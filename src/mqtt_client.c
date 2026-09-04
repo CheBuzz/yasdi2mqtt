@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <MQTTClient.h>
+#include <pthread.h>
 
 #define MQTT_KEEP_ALIVE_INTERVAL 20
 #define MQTT_DISCONNECT_TIMEOUT 1000
@@ -15,6 +16,22 @@
 #define MQTT_SSL_VERSION MQTT_SSL_VERSION_TLS_1_2
 #define MAX_SERVER_URL_SIZE 128
 #define MAX_TOPIC_NAME_SIZE 128
+
+/** Queued request received via mqtt (processed off the paho client thread). */
+struct mc_request {
+    char *sn;
+    char *action;
+    char *channel;
+    char *payload;
+    struct mc_request *next;
+};
+
+static struct mc_request *request_queue_head = NULL;
+static struct mc_request *request_queue_tail = NULL;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t worker_thread;
+static bool worker_running = false;
 
 char *topic_pfx;
 int qos_lvl;
@@ -25,6 +42,8 @@ MQTTClient_SSLOptions ssl_options;
 void (*mc_set_request_cb)(const char *sn, const char *action, const char *channel, const char *payload) = NULL;
 
 bool mqtt_connect();
+static void enqueue_request(const char *sn, const char *action, const char *channel, const char *payload);
+static void *request_worker(void *arg);
 void mqtt_conn_lost_cb(void *context, char *cause);
 int mqtt_msg_arrived_cb(void *context, char *topicName, int topicLen, MQTTClient_message *message);
 static void subscribe_set_topics();
@@ -76,6 +95,14 @@ bool mqtt_init(char *server, uint16_t port, char *ssl_cert, char *user, char *pa
     if (status != MQTTCLIENT_SUCCESS)
     {
         log_fatal("Error while setting MQTTClient callbacks: %d", status);
+        return false;
+    }
+
+    // Start worker thread that processes incoming requests off the paho thread
+    worker_running = true;
+    if (pthread_create(&worker_thread, NULL, request_worker, NULL) != 0)
+    {
+        log_fatal("Unable to start mqtt request worker thread");
         return false;
     }
 
@@ -144,8 +171,96 @@ static void subscribe_set_topics()
 
 void mqtt_destroy()
 {
+    // Stop the request worker thread and drain the queue
+    pthread_mutex_lock(&queue_mutex);
+    worker_running = false;
+    pthread_cond_broadcast(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+    pthread_join(worker_thread, NULL);
+
+    while (request_queue_head != NULL)
+    {
+        struct mc_request *req = request_queue_head;
+        request_queue_head = req->next;
+        free(req->sn);
+        free(req->action);
+        free(req->channel);
+        free(req->payload);
+        free(req);
+    }
+
     MQTTClient_disconnect(client, MQTT_DISCONNECT_TIMEOUT);
     MQTTClient_destroy(&client);
+}
+
+static void enqueue_request(const char *sn, const char *action, const char *channel, const char *payload)
+{
+    struct mc_request *req = malloc(sizeof(struct mc_request));
+    if (req == NULL)
+    {
+        log_error("Unable to allocate memory for mqtt request");
+        return;
+    }
+    req->sn = strdup(sn);
+    req->action = strdup(action);
+    req->channel = strdup(channel);
+    req->payload = strdup(payload);
+    req->next = NULL;
+
+    if (req->sn == NULL || req->action == NULL || req->channel == NULL || req->payload == NULL)
+    {
+        log_error("Unable to allocate memory for mqtt request");
+        free(req->sn);
+        free(req->action);
+        free(req->channel);
+        free(req->payload);
+        free(req);
+        return;
+    }
+
+    pthread_mutex_lock(&queue_mutex);
+    if (request_queue_tail != NULL)
+        request_queue_tail->next = req;
+    else
+        request_queue_head = req;
+    request_queue_tail = req;
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+static void *request_worker(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        pthread_mutex_lock(&queue_mutex);
+        while (request_queue_head == NULL && worker_running)
+            pthread_cond_wait(&queue_cond, &queue_mutex);
+
+        if (!worker_running && request_queue_head == NULL)
+        {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+
+        struct mc_request *req = request_queue_head;
+        request_queue_head = req->next;
+        if (request_queue_head == NULL)
+            request_queue_tail = NULL;
+        pthread_mutex_unlock(&queue_mutex);
+
+        if (mc_set_request_cb != NULL)
+            (*mc_set_request_cb)(req->sn, req->action, req->channel, req->payload);
+
+        free(req->sn);
+        free(req->action);
+        free(req->channel);
+        free(req->payload);
+        free(req);
+    }
+
+    return NULL;
 }
 
 bool mqtt_send_raw(const char *topic, const char *payload, bool retained)
@@ -220,7 +335,9 @@ int mqtt_msg_arrived_cb(void *context, char *topicName, int topicLen, MQTTClient
                 memcpy(payload, message->payload, message->payloadlen);
                 payload[message->payloadlen] = '\0';
 
-                (*mc_set_request_cb)(sn, action, channel, payload);
+                // Only enqueue; processing happens on the worker thread so the
+                // paho client thread is never blocked (avoids deadlocks)
+                enqueue_request(sn, action, channel, payload);
                 free(payload);
             }
             free(rest_copy);

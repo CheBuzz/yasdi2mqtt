@@ -30,6 +30,10 @@ void device_detection_cb(TYASDIDetectionSub event, DWORD device);
 
 static pthread_mutex_t yasdi_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Separate mutex guarding active_devices (device_detection_cb runs on a
+// yasdi event thread and must not take yasdi_mutex to avoid recursive locks)
+static pthread_mutex_t devices_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /**
  * Initializes yasdiMaster, enables the driver and prepares for device detection. Must be called first.
  * @param ini_file               relative location of yasdi.ini file
@@ -108,11 +112,13 @@ void yh_loop()
 
         // Count active devices
         DWORD active_device_count = 0;
+        pthread_mutex_lock(&devices_mutex);
         for (DWORD i = 0; i < max_device_count; i++)
         {
             if (active_devices[i] != 0)
                 active_device_count++;
         }
+        pthread_mutex_unlock(&devices_mutex);
 
         // Check for new devices if not all are online yet
         if (active_device_count != max_device_count)
@@ -169,10 +175,18 @@ struct device_value_t **yh_get_values()
     int status;
     struct device_value_t **values = calloc(max_device_count, sizeof(struct device_value_t *));
 
+    // Snapshot active devices (guarded by devices_mutex) so the long-running
+    // channel reads below don't race with device_detection_cb
+    DWORD device_snapshot[max_device_count];
+    pthread_mutex_lock(&devices_mutex);
+    memcpy(device_snapshot, active_devices, max_device_count * sizeof(DWORD));
+    pthread_mutex_unlock(&devices_mutex);
+
     log_debug("Starting device value fetch (sync)...");
+
     for (DWORD device_i = 0; device_i < max_device_count; device_i++)
     {
-        DWORD device = active_devices[device_i];
+        DWORD device = device_snapshot[device_i];
         if (device == 0)
             continue;
 
@@ -271,6 +285,8 @@ void device_detection_cb(TYASDIDetectionSub event, DWORD device)
 {
     log_debug("Event %d fired for device %u", event, device);
 
+    pthread_mutex_lock(&devices_mutex);
+
     // Check if device is already active & find any free index if possible
     DWORD device_i, free_item_i;
     bool device_active = false, has_free_item = false;
@@ -322,6 +338,8 @@ void device_detection_cb(TYASDIDetectionSub event, DWORD device)
     default:
         log_warn("Got invalid event (device: %u) for device_detection_cb: %d", device, event);
     }
+
+    pthread_mutex_unlock(&devices_mutex);
 }
 /*
  * Installer-level access ('inst') is required for parameter writes.
