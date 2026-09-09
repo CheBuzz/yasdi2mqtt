@@ -7,45 +7,65 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <MQTTClient.h>
 #include <pthread.h>
+#include <MQTTAsync.h>
 
 #define MQTT_KEEP_ALIVE_INTERVAL 20
 #define MQTT_DISCONNECT_TIMEOUT 1000
-#define MQTT_RECONNECT_INTERVAL 10
 #define MQTT_SSL_VERSION MQTT_SSL_VERSION_TLS_1_2
 #define MAX_SERVER_URL_SIZE 128
 #define MAX_TOPIC_NAME_SIZE 128
 
-/** Queued request received via mqtt (processed off the paho client thread). */
-struct mc_request {
-    char *sn;
-    char *action;
-    char *channel;
-    char *payload;
-    struct mc_request *next;
-};
-
-static struct mc_request *request_queue_head = NULL;
-static struct mc_request *request_queue_tail = NULL;
-static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t worker_thread;
-static bool worker_running = false;
-
 char *topic_pfx;
 int qos_lvl;
-MQTTClient client;
-MQTTClient_connectOptions options;
-MQTTClient_SSLOptions ssl_options;
+MQTTAsync client;
+MQTTAsync_connectOptions conn_opts;
+MQTTAsync_SSLOptions ssl_options;
+
+// Defined in main.c: set once the client is actually connected so discovery
+// publishes can't race a pending connect
+extern bool mqtt_client_ready;
 
 void (*mc_set_request_cb)(const char *sn, const char *action, const char *channel, const char *payload) = NULL;
 
-bool mqtt_connect();
-static void enqueue_request(const char *sn, const char *action, const char *channel, const char *payload);
-static void *request_worker(void *arg);
+/*
+ * Requests from the message-arrived callback are only queued here and executed
+ * by a dedicated worker thread: the callback runs on a paho thread and must
+ * return quickly, while the yasdi set/get requests it triggers block for
+ * seconds (authentication, device lookup, serial bus communication).
+ */
+struct mqtt_request
+{
+    char *rest;     // "sn/action/channel"; sn/action/channel point into it
+    char *payload;  // NUL-terminated copy of the message payload
+    char *sn;
+    char *action;
+    char *channel;
+    struct mqtt_request *next;
+};
+
+/*
+ * Unlike the sync client (MQTTClient), the async client (MQTTAsync) is
+ * thread-safe: publishing from our threads is fine while paho processes
+ * incoming packets and reconnects on its own threads - no serialization
+ * needed, and no hand-rolled reconnect logic that could race paho's internal
+ * state (that crashed twice: an invalid free(), then a SIGSEGV during
+ * reconnect).
+ */
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static struct mqtt_request *queue_head = NULL;
+static struct mqtt_request *queue_tail = NULL;
+static pthread_t worker_thread;
+
+static void *worker_main(void *arg);
+static void enqueue_request(struct mqtt_request *req);
+
 void mqtt_conn_lost_cb(void *context, char *cause);
-int mqtt_msg_arrived_cb(void *context, char *topicName, int topicLen, MQTTClient_message *message);
+static void mqtt_connected_cb(void *context, char *cause);
+static void mqtt_connect_failure_cb(void *context, MQTTAsync_failureData *response);
+static void mqtt_subscribe_failure_cb(void *context, MQTTAsync_failureData *response);
+int mqtt_msg_arrived_cb(void *context, char *topicName, int topicLen, MQTTAsync_message *message);
 static void subscribe_set_topics();
 bool mqtt_send_raw(const char *topic, const char *payload, bool retained);
 
@@ -55,25 +75,39 @@ bool mqtt_init(char *server, uint16_t port, char *ssl_cert, char *user, char *pa
     topic_pfx = topic_prefix;
     qos_lvl = qos_level;
 
-    options = (MQTTClient_connectOptions)MQTTClient_connectOptions_initializer;
-    options.keepAliveInterval = MQTT_KEEP_ALIVE_INTERVAL;
-    options.cleansession = false;
+    conn_opts = (MQTTAsync_connectOptions)MQTTAsync_connectOptions_initializer;
+    conn_opts.keepAliveInterval = MQTT_KEEP_ALIVE_INTERVAL;
+    conn_opts.cleansession = false;
+
+    /*
+     * Let paho handle reconnects itself: it retries with exponential backoff
+     * (also covering a failed initial connect) and re-establishes the session
+     * without us touching the client from other threads. Manually re-connecting
+     * to the sync client from a helper thread kept racing with paho's internal
+     * teardown of the dead connection and crashed (SIGSEGV, thread 8).
+     */
+    conn_opts.automaticReconnect = 1;
+    // Don't set the reconnect delay fields: older paho headers don't have
+    // automaticReconnectDelayMin/Max, and the defaults (doubling backoff up to
+    // 60 s) are fine for us
+    conn_opts.connectTimeout = MQTT_KEEP_ALIVE_INTERVAL;
+    conn_opts.onFailure = mqtt_connect_failure_cb;
 
     if (user != NULL && password != NULL)
     {
-        options.username = user;
-        options.password = password;
+        conn_opts.username = user;
+        conn_opts.password = password;
     }
 
     if (ssl_cert != NULL)
     {
         log_debug("Setting up ssl for mqtt connection");
 
-        ssl_options = (MQTTClient_SSLOptions)MQTTClient_SSLOptions_initializer;
+        ssl_options = (MQTTAsync_SSLOptions)MQTTAsync_SSLOptions_initializer;
         ssl_options.trustStore = ssl_cert;
         ssl_options.sslVersion = MQTT_SSL_VERSION;
 
-        options.ssl = &ssl_options;
+        conn_opts.ssl = &ssl_options;
     }
 
     char url[MAX_SERVER_URL_SIZE];
@@ -82,69 +116,78 @@ bool mqtt_init(char *server, uint16_t port, char *ssl_cert, char *user, char *pa
         log_fatal("MQTT server exceeds maximum length");
         return false;
     }
-    snprintf(url, sizeof(url), "%s://%s:%u", options.ssl ? "ssl" : "tcp", server, port);
+    snprintf(url, sizeof(url), "%s://%s:%u", conn_opts.ssl ? "ssl" : "tcp", server, port);
 
-    status = MQTTClient_create(&client, url, client_id, MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    if (status != MQTTCLIENT_SUCCESS)
+    status = MQTTAsync_create(&client, url, client_id, MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    if (status != MQTTASYNC_SUCCESS)
     {
-        log_fatal("Error while creating MQTTClient instance: %d", status);
+        log_fatal("Error while creating MQTTAsync instance: %d", status);
         return false;
     }
 
-    status = MQTTClient_setCallbacks(client, NULL, mqtt_conn_lost_cb, mqtt_msg_arrived_cb, NULL);
-    if (status != MQTTCLIENT_SUCCESS)
+    status = MQTTAsync_setCallbacks(client, NULL, mqtt_conn_lost_cb, mqtt_msg_arrived_cb, NULL);
+    if (status != MQTTASYNC_SUCCESS)
     {
-        log_fatal("Error while setting MQTTClient callbacks: %d", status);
+        log_fatal("Error while setting MQTTAsync callbacks: %d", status);
         return false;
     }
 
-    // Start worker thread that processes incoming requests off the paho thread
-    worker_running = true;
-    if (pthread_create(&worker_thread, NULL, request_worker, NULL) != 0)
+    // (Re-)subscribe on every successful connect, including the automatic
+    // ones after a connection loss (connect onSuccess would only fire once)
+    status = MQTTAsync_setConnected(client, NULL, mqtt_connected_cb);
+    if (status != MQTTASYNC_SUCCESS)
     {
-        log_fatal("Unable to start mqtt request worker thread");
+        log_fatal("Error while setting MQTTAsync connected callback: %d", status);
         return false;
     }
 
-    return mqtt_connect();
+    // Start the request worker before connecting: queued messages may arrive
+    // immediately after the subscription (clean session disabled)
+    status = pthread_create(&worker_thread, NULL, worker_main, NULL);
+    if (status != 0)
+    {
+        log_fatal("Unable to start mqtt request worker thread (status: %d)", status);
+        return false;
+    }
+
+    // Returns immediately; progress is reported via the callbacks and failed
+    // attempts are retried automatically
+    status = MQTTAsync_connect(client, &conn_opts);
+    if (status != MQTTASYNC_SUCCESS)
+    {
+        log_fatal("Unable to start mqtt connection (status: %d)", status);
+        return false;
+    }
+
+    return true;
 }
 
-bool mqtt_connect()
+/*
+ * Called by paho after every successful connect, including the automatic
+ * reconnects after a connection loss.
+ */
+static void mqtt_connected_cb(void *context, char *cause)
 {
-    int status;
+    (void)context;
+    (void)cause;
+    log_info("Connection to mqtt broker established");
+    mqtt_client_ready = true;
+    subscribe_set_topics();
+}
 
-    do
-    {
-        status = MQTTClient_connect(client, &options);
+static void mqtt_connect_failure_cb(void *context, MQTTAsync_failureData *response)
+{
+    (void)context;
+    log_warn("Unable to connect to mqtt broker (code: %d, message: %s), automatic reconnect in progress",
+             response != NULL ? response->code : 0,
+             response != NULL && response->message != NULL ? response->message : "N/A");
+}
 
-        switch (status)
-        {
-        case MQTTCLIENT_SUCCESS:
-            log_info("Connection to mqtt broker established");
-            subscribe_set_topics();
-            return true;
-        case 1:
-            log_warn("Connection refused while connecting to mqtt broker: Unacceptable protocol version");
-            return false;
-        case 2:
-            log_warn("Connection refused while connecting to mqtt broker: Identifier rejected");
-            return false;
-        case 3:
-            // Continue connection attempts
-            log_warn("Connection refused while connecting to mqtt broker: Server unavailable");
-            break;
-        case 4:
-            log_warn("Connection refused while connecting to mqtt broker: Bad user name or password");
-            return false;
-        case 5:
-            log_warn("Connection refused while connecting to mqtt broker: Not authorized");
-            return false;
-        default:
-            log_warn("Unknown error while connecting to mqtt broker (status: %d). Going to retry in %d seconds...", status, MQTT_RECONNECT_INTERVAL);
-        }
-
-        sleep(MQTT_RECONNECT_INTERVAL);
-    } while (status != MQTTCLIENT_SUCCESS);
+static void mqtt_subscribe_failure_cb(void *context, MQTTAsync_failureData *response)
+{
+    (void)context;
+    log_error("Subscription was not acknowledged (code: %d)",
+              response != NULL ? response->code : 0);
 }
 
 static void subscribe_set_topics()
@@ -161,118 +204,40 @@ static void subscribe_set_topics()
             continue;
         }
 
-        int status = MQTTClient_subscribe(client, filter, qos_lvl);
-        if (status != MQTTCLIENT_SUCCESS)
+        MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
+        opts.onFailure = mqtt_subscribe_failure_cb;
+
+        int status = MQTTAsync_subscribe(client, filter, qos_lvl, &opts);
+        if (status != MQTTASYNC_SUCCESS)
             log_error("Unable to subscribe to %s (status: %d)", filter, status);
         else
-            log_info("Subscribed to %s", filter);
+            log_info("Subscribing to %s", filter);
     }
 }
 
 void mqtt_destroy()
 {
-    // Stop the request worker thread and drain the queue
-    pthread_mutex_lock(&queue_mutex);
-    worker_running = false;
-    pthread_cond_broadcast(&queue_cond);
-    pthread_mutex_unlock(&queue_mutex);
-    pthread_join(worker_thread, NULL);
-
-    while (request_queue_head != NULL)
-    {
-        struct mc_request *req = request_queue_head;
-        request_queue_head = req->next;
-        free(req->sn);
-        free(req->action);
-        free(req->channel);
-        free(req->payload);
-        free(req);
-    }
-
-    MQTTClient_disconnect(client, MQTT_DISCONNECT_TIMEOUT);
-    MQTTClient_destroy(&client);
-}
-
-static void enqueue_request(const char *sn, const char *action, const char *channel, const char *payload)
-{
-    struct mc_request *req = malloc(sizeof(struct mc_request));
-    if (req == NULL)
-    {
-        log_error("Unable to allocate memory for mqtt request");
-        return;
-    }
-    req->sn = strdup(sn);
-    req->action = strdup(action);
-    req->channel = strdup(channel);
-    req->payload = strdup(payload);
-    req->next = NULL;
-
-    if (req->sn == NULL || req->action == NULL || req->channel == NULL || req->payload == NULL)
-    {
-        log_error("Unable to allocate memory for mqtt request");
-        free(req->sn);
-        free(req->action);
-        free(req->channel);
-        free(req->payload);
-        free(req);
-        return;
-    }
-
-    pthread_mutex_lock(&queue_mutex);
-    if (request_queue_tail != NULL)
-        request_queue_tail->next = req;
-    else
-        request_queue_head = req;
-    request_queue_tail = req;
-    pthread_cond_signal(&queue_cond);
-    pthread_mutex_unlock(&queue_mutex);
-}
-
-static void *request_worker(void *arg)
-{
-    (void)arg;
-
-    for (;;)
-    {
-        pthread_mutex_lock(&queue_mutex);
-        while (request_queue_head == NULL && worker_running)
-            pthread_cond_wait(&queue_cond, &queue_mutex);
-
-        if (!worker_running && request_queue_head == NULL)
-        {
-            pthread_mutex_unlock(&queue_mutex);
-            break;
-        }
-
-        struct mc_request *req = request_queue_head;
-        request_queue_head = req->next;
-        if (request_queue_head == NULL)
-            request_queue_tail = NULL;
-        pthread_mutex_unlock(&queue_mutex);
-
-        if (mc_set_request_cb != NULL)
-            (*mc_set_request_cb)(req->sn, req->action, req->channel, req->payload);
-
-        free(req->sn);
-        free(req->action);
-        free(req->channel);
-        free(req->payload);
-        free(req);
-    }
-
-    return NULL;
+    // Only ever call this from the main thread (never from paho callbacks)
+    MQTTAsync_disconnectOptions opts = MQTTAsync_disconnectOptions_initializer;
+    opts.timeout = MQTT_DISCONNECT_TIMEOUT;
+    MQTTAsync_disconnect(client, &opts);
+    MQTTAsync_destroy(&client);
 }
 
 bool mqtt_send_raw(const char *topic, const char *payload, bool retained)
 {
-    MQTTClient_message msg = MQTTClient_message_initializer;
+    MQTTAsync_message msg = MQTTAsync_message_initializer;
+    MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
+
     msg.payload = (void *)payload;
-    msg.payloadlen = strlen(payload);
+    msg.payloadlen = (int)strlen(payload);
     msg.qos = qos_lvl;
     msg.retained = retained;
 
-    int status = MQTTClient_publishMessage(client, topic, &msg, NULL);
-    if (status != MQTTCLIENT_SUCCESS)
+    // Thread-safe on the async client: fine to publish while paho processes
+    // incoming packets or reconnects on its own threads
+    int status = MQTTAsync_sendMessage(client, topic, &msg, &opts);
+    if (status != MQTTASYNC_SUCCESS)
     {
         log_error("Unable to publish via mqtt (status: %d)", status);
         return false;
@@ -304,47 +269,108 @@ bool mqtt_send_retained(char *topic, char *payload)
     return mqtt_send_topic(topic, payload, true);
 }
 
+/*
+ * Runs on a paho thread whenever the connection is lost. Do NOT call connect
+ * (or any blocking paho function) from here: with the sync client this raced
+ * paho's internal connection teardown and crashed (SIGSEGV right after the
+ * "Lost connection" log). automaticReconnect lets paho re-establish the
+ * session itself; mqtt_connected_cb then resubscribes.
+ */
 void mqtt_conn_lost_cb(void *context, char *cause)
 {
-    log_warn("Lost connection to mqtt broker: %s", cause);
-    mqtt_connect();
+    (void)context;
+    mqtt_client_ready = false;
+    log_warn("Lost connection to mqtt broker: %s (automatic reconnect in progress)", cause != NULL ? cause : "unknown");
 }
 
-int mqtt_msg_arrived_cb(void *context, char *topicName, int topicLen, MQTTClient_message *message)
+static void enqueue_request(struct mqtt_request *req)
+{
+    req->next = NULL;
+
+    pthread_mutex_lock(&queue_mutex);
+    if (queue_tail != NULL)
+        queue_tail->next = req;
+    else
+        queue_head = req;
+    queue_tail = req;
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+static void *worker_main(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        pthread_mutex_lock(&queue_mutex);
+        while (queue_head == NULL)
+            pthread_cond_wait(&queue_cond, &queue_mutex);
+        struct mqtt_request *req = queue_head;
+        queue_head = req->next;
+        if (queue_head == NULL)
+            queue_tail = NULL;
+        pthread_mutex_unlock(&queue_mutex);
+
+        if (mc_set_request_cb != NULL)
+            (*mc_set_request_cb)(req->sn, req->action, req->channel, req->payload);
+
+        free(req->rest);
+        free(req->payload);
+        free(req);
+    }
+    return NULL;
+}
+
+int mqtt_msg_arrived_cb(void *context, char *topicName, int topicLen, MQTTAsync_message *message)
 {
     // Topic format: <prefix>/<device_sn>/<action>/<ChannelName>
-    if (mc_set_request_cb != NULL && topicName != NULL && message != NULL)
+    if (topicName != NULL && message != NULL && message->payloadlen > 0)
     {
-        size_t pfx_len = strlen(topic_pfx);
-        const char *topic = topicName;
-
-        if (topicLen > 0 && (size_t)topicLen < pfx_len)
-            pfx_len = (size_t)topicLen;
-
-        if (strncmp(topic, topic_pfx, pfx_len) == 0 && strlen(topic) > pfx_len)
+        // paho does not NUL-terminate the topic when topicLen > 0
+        size_t topic_len = topicLen > 0 ? (size_t)topicLen : strlen(topicName);
+        char *topic = malloc(topic_len + 1);
+        if (topic != NULL)
         {
-            const char *rest = topic + pfx_len + 1; // skip '/'
-            char *rest_copy = strdup(rest);
-            char *sn = strtok(rest_copy, "/");
-            char *action = strtok(NULL, "/");
-            char *channel = strtok(NULL, "");
+            memcpy(topic, topicName, topic_len);
+            topic[topic_len] = '\0';
 
-            if (sn != NULL && action != NULL && channel != NULL && message->payloadlen > 0)
+            size_t pfx_len = strlen(topic_pfx);
+            if (strncmp(topic, topic_pfx, pfx_len) == 0 && topic_len > pfx_len + 1)
             {
-                char *payload = malloc(message->payloadlen + 1);
-                memcpy(payload, message->payload, message->payloadlen);
-                payload[message->payloadlen] = '\0';
+                struct mqtt_request *req = calloc(1, sizeof(*req));
+                if (req != NULL)
+                {
+                    req->rest = strdup(topic + pfx_len + 1); // skip '/'
+                    req->payload = malloc(message->payloadlen + 1);
+                    if (req->rest != NULL && req->payload != NULL)
+                    {
+                        memcpy(req->payload, message->payload, message->payloadlen);
+                        req->payload[message->payloadlen] = '\0';
 
-                // Only enqueue; processing happens on the worker thread so the
-                // paho client thread is never blocked (avoids deadlocks)
-                enqueue_request(sn, action, channel, payload);
-                free(payload);
+                        req->sn = strtok(req->rest, "/");
+                        req->action = strtok(NULL, "/");
+                        req->channel = strtok(NULL, "");
+                    }
+
+                    if (req->rest == NULL || req->payload == NULL ||
+                        req->sn == NULL || req->action == NULL || req->channel == NULL)
+                    {
+                        free(req->rest);
+                        free(req->payload);
+                        free(req);
+                    }
+                    else
+                        enqueue_request(req);
+                }
             }
-            free(rest_copy);
+            free(topic);
         }
     }
 
-    MQTTClient_freeMessage(&message);
-    MQTTClient_free(&topicName);
+    // Async client: the application must free the message and topic before
+    // returning (thread-safe, runs on a paho thread)
+    MQTTAsync_freeMessage(&message);
+    MQTTAsync_free(topicName);
     return 1;
 }

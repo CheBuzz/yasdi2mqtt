@@ -9,6 +9,10 @@
 
 #define MAX_DRIVER_COUNT 128
 #define MAX_CHANNEL_COUNT 300
+
+/* Retry settings for requests arriving before device detection has finished (startup) */
+#define DEVICE_WAIT_ATTEMPTS 12
+#define DEVICE_WAIT_INTERVAL 5
 #include <pthread.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -29,10 +33,6 @@ struct device_value_t **yh_get_values();
 void device_detection_cb(TYASDIDetectionSub event, DWORD device);
 
 static pthread_mutex_t yasdi_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Separate mutex guarding active_devices (device_detection_cb runs on a
-// yasdi event thread and must not take yasdi_mutex to avoid recursive locks)
-static pthread_mutex_t devices_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Initializes yasdiMaster, enables the driver and prepares for device detection. Must be called first.
@@ -86,6 +86,9 @@ bool yh_init(const char *ini_file, DWORD device_count, unsigned int device_updat
     active_devices = calloc(max_device_count, sizeof(DWORD));
     yasdiMasterAddEventListener(device_detection_cb, YASDI_EVENT_DEVICE_DETECTION);
 
+    // Authenticate at installer level so subsequent parameter detection/writes succeed
+    yh_ensure_auth();
+
     return true;
 }
 
@@ -112,20 +115,22 @@ void yh_loop()
 
         // Count active devices
         DWORD active_device_count = 0;
-        pthread_mutex_lock(&devices_mutex);
         for (DWORD i = 0; i < max_device_count; i++)
         {
             if (active_devices[i] != 0)
                 active_device_count++;
         }
-        pthread_mutex_unlock(&devices_mutex);
 
         // Check for new devices if not all are online yet
         if (active_device_count != max_device_count)
         {
             log_debug("Not all devices are online, starting device detection (async)...");
 
+            // yasdi is not thread-safe: serialize against set/get requests
+            // arriving via the mqtt callback thread
+            pthread_mutex_lock(&yasdi_mutex);
             int status = DoStartDeviceDetection(max_device_count, false);
+            pthread_mutex_unlock(&yasdi_mutex);
             switch (status)
             {
             case YE_OK:
@@ -175,18 +180,10 @@ struct device_value_t **yh_get_values()
     int status;
     struct device_value_t **values = calloc(max_device_count, sizeof(struct device_value_t *));
 
-    // Snapshot active devices (guarded by devices_mutex) so the long-running
-    // channel reads below don't race with device_detection_cb
-    DWORD device_snapshot[max_device_count];
-    pthread_mutex_lock(&devices_mutex);
-    memcpy(device_snapshot, active_devices, max_device_count * sizeof(DWORD));
-    pthread_mutex_unlock(&devices_mutex);
-
     log_debug("Starting device value fetch (sync)...");
-
     for (DWORD device_i = 0; device_i < max_device_count; device_i++)
     {
-        DWORD device = device_snapshot[device_i];
+        DWORD device = active_devices[device_i];
         if (device == 0)
             continue;
 
@@ -285,8 +282,6 @@ void device_detection_cb(TYASDIDetectionSub event, DWORD device)
 {
     log_debug("Event %d fired for device %u", event, device);
 
-    pthread_mutex_lock(&devices_mutex);
-
     // Check if device is already active & find any free index if possible
     DWORD device_i, free_item_i;
     bool device_active = false, has_free_item = false;
@@ -338,8 +333,6 @@ void device_detection_cb(TYASDIDetectionSub event, DWORD device)
     default:
         log_warn("Got invalid event (device: %u) for device_detection_cb: %d", device, event);
     }
-
-    pthread_mutex_unlock(&devices_mutex);
 }
 /*
  * Installer-level access ('inst') is required for parameter writes.
@@ -375,37 +368,6 @@ static void channel_cache_path(DWORD device_sn, char *path, size_t size)
     snprintf(path, size, PARAM_CACHE_FMT, cache_dir, (unsigned long)device_sn);
 }
 
-/*
- * Try to resolve a parameter channel handle from the on-disk cache file.
- * Returns 0 if the channel was not found (or cache disabled/missing).
- */
-static DWORD find_param_channel_cached(DWORD device_sn, const char *channel_name)
-{
-    if (cache_dir == NULL)
-        return 0;
-
-    char path[256];
-    channel_cache_path(device_sn, path, sizeof(path));
-
-    FILE *file = fopen(path, "r");
-    if (file == NULL)
-        return 0;
-
-    char line[128], name[MAX_CHANNEL_NAME_SIZE];
-    unsigned long handle;
-    DWORD found = 0;
-    while (fgets(line, sizeof(line), file))
-    {
-        if (sscanf(line, "%lu %19[^\n\r]", &handle, name) == 2 && strcmp(name, channel_name) == 0)
-        {
-            found = (DWORD)handle;
-            break;
-        }
-    }
-    fclose(file);
-    return found;
-}
-
 /* Write all parameter channel handles/names of a device to the cache file. */
 static void write_param_channel_cache(DWORD device, DWORD device_sn)
 {
@@ -435,15 +397,14 @@ static void write_param_channel_cache(DWORD device, DWORD device_sn)
 }
 
 /*
- * Resolve a parameter channel handle by name. Uses the cache file if available,
- * otherwise enumerates PARAMCHANNELS from the device and populates the cache.
+ * Resolve a parameter channel handle by name from the CURRENT session's
+ * channel list. Never use handles from the on-disk cache file: yasdi
+ * reassigns channel handles on every start, so a cached handle can point
+ * outside the current channel container - yasdi does not validate it, and
+ * writing through it corrupts the heap (crash later inside free()).
  */
 static DWORD find_param_channel(DWORD device, DWORD device_sn, const char *channel_name)
 {
-    DWORD channel = find_param_channel_cached(device_sn, channel_name);
-    if (channel != 0)
-        return channel;
-
     DWORD channels[MAX_CHANNEL_COUNT];
     DWORD channel_count = GetChannelHandlesEx(device, channels, MAX_CHANNEL_COUNT, PARAMCHANNELS);
     if (channel_count == 0)
@@ -460,20 +421,47 @@ static DWORD find_param_channel(DWORD device, DWORD device_sn, const char *chann
     return 0;
 }
 
+/*
+ * Resolve a device handle by sn, waiting up to DEVICE_WAIT_ATTEMPTS * DEVICE_WAIT_INTERVAL
+ * seconds for pending device detection if the device is not online yet. Queued mqtt
+ * messages (clean session disabled) may arrive right after startup, before yasdi has
+ * finished detecting the devices.
+ */
+static DWORD find_device_by_sn(DWORD device_sn)
+{
+    for (int attempt = 1; attempt <= DEVICE_WAIT_ATTEMPTS; attempt++)
+    {
+        pthread_mutex_lock(&yasdi_mutex);
+        DWORD device = FindDeviceSN(device_sn);
+        pthread_mutex_unlock(&yasdi_mutex);
+
+        if (device != 0)
+            return device;
+
+        if (attempt < DEVICE_WAIT_ATTEMPTS)
+        {
+            log_debug("Device %lu is not online yet (attempt %d/%d), retrying in %d seconds...",
+                      (unsigned long)device_sn, attempt, DEVICE_WAIT_ATTEMPTS, DEVICE_WAIT_INTERVAL);
+            sleep(DEVICE_WAIT_INTERVAL);
+        }
+    }
+
+    return 0;
+}
+
 bool yh_set_value(DWORD device_sn, const char *channel_name, const char *value_str)
 {
     if (channel_name == NULL || value_str == NULL || value_str[0] == '\0')
         return false;
 
-    pthread_mutex_lock(&yasdi_mutex);
-
-    DWORD device = FindDeviceSN(device_sn);
+    DWORD device = find_device_by_sn(device_sn);
     if (device == 0)
     {
         log_error("Unable to find device with sn %lu", (unsigned long)device_sn);
-        pthread_mutex_unlock(&yasdi_mutex);
         return false;
     }
+
+    pthread_mutex_lock(&yasdi_mutex);
 
     DWORD channel = find_param_channel(device, device_sn, channel_name);
     if (channel == 0)
@@ -517,15 +505,14 @@ bool yh_get_param_value(DWORD device_sn, const char *channel_name, char *value_b
     if (channel_name == NULL || value_buf == NULL)
         return false;
 
-    pthread_mutex_lock(&yasdi_mutex);
-
-    DWORD device = FindDeviceSN(device_sn);
+    DWORD device = find_device_by_sn(device_sn);
     if (device == 0)
     {
         log_error("Unable to find device with sn %lu", (unsigned long)device_sn);
-        pthread_mutex_unlock(&yasdi_mutex);
         return false;
     }
+
+    pthread_mutex_lock(&yasdi_mutex);
 
     DWORD channel = find_param_channel(device, device_sn, channel_name);
     if (channel == 0)
@@ -572,22 +559,42 @@ void yh_foreach_param_channel(DWORD device_sn, yh_param_channel_cb cb)
     if (channel_count > 0)
         write_param_channel_cache(device, device_sn);
 
+    /*
+     * ALL yasdi calls must happen under the mutex: yasdi has no internal
+     * locking, and leaving the per-channel queries unlocked (as before) raced
+     * with set/get requests on the mqtt thread and corrupted yasdi's internal
+     * state (crash inside libc string/malloc code). Snapshot the channel info
+     * here and invoke the callback after unlocking, since the callback
+     * publishes via paho.
+     */
+    struct param_channel_info_t *infos = NULL;
+    if (channel_count > 0)
+        infos = calloc(channel_count, sizeof(struct param_channel_info_t));
+
+    for (DWORD i = 0; infos != NULL && i < channel_count; i++)
+    {
+        struct param_channel_info_t *info = &infos[i];
+
+        if (GetChannelName(channels[i], info->name, sizeof(info->name)) != YE_OK)
+            continue; // name stays empty -> skipped below
+        GetChannelUnit(channels[i], info->unit, sizeof(info->unit));
+
+        int stat_cnt = GetChannelStatTextCnt(channels[i]);
+        info->stat_text_cnt = stat_cnt > MAX_STAT_TEXT_COUNT ? MAX_STAT_TEXT_COUNT : stat_cnt;
+        for (int t = 0; t < info->stat_text_cnt; t++)
+            GetChannelStatText(channels[i], t, info->stat_texts[t], MAX_VALUE_STR_SIZE);
+    }
+
     pthread_mutex_unlock(&yasdi_mutex);
+
+    if (infos == NULL)
+        return;
 
     for (DWORD i = 0; i < channel_count; i++)
     {
-        struct param_channel_info_t info;
-        memset(&info, 0, sizeof(info));
-
-        if (GetChannelName(channels[i], info.name, sizeof(info.name)) != YE_OK)
-            continue;
-        GetChannelUnit(channels[i], info.unit, sizeof(info.unit));
-
-        int stat_cnt = GetChannelStatTextCnt(channels[i]);
-        info.stat_text_cnt = stat_cnt > MAX_STAT_TEXT_COUNT ? MAX_STAT_TEXT_COUNT : stat_cnt;
-        for (int t = 0; t < info.stat_text_cnt; t++)
-            GetChannelStatText(channels[i], t, info.stat_texts[t], MAX_VALUE_STR_SIZE);
-
-        cb(device_sn, &info);
+        if (infos[i].name[0] != '\0')
+            cb(device_sn, &infos[i]);
     }
+
+    free(infos);
 }

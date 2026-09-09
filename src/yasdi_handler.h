@@ -53,7 +53,7 @@ bool yh_get_param_value(DWORD device_sn, const char *channel_name, char *value_b
 
 /**
  * Iterates over all parameter channels of a device and invokes cb for each.
- * Uses the on-disk channel cache (YASDI_CACHE_DIR) if available.
+ * Writes the channel list to the on-disk cache (YASDI_CACHE_DIR) for reference.
  */
 void yh_foreach_param_channel(DWORD device_sn, yh_param_channel_cb cb);
 

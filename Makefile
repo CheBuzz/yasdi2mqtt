@@ -6,11 +6,10 @@ SRC=src/main.c src/yasdi_handler.c src/mqtt_client.c src/log.c
 
 CC=gcc
 CFLAGS=-std=c11 -O3 -DLOG_USE_COLOR $(IDIRS)
-DEPS=-lyasdimaster -lcjson -lpaho-mqtt3cs
-
-ifeq ($(DEBUG), 1)
-	CFLAGS+= -g
-endif
+# -lpaho-mqtt3a: paho *async* client - thread-safe with built-in automatic
+# reconnect. The sync client (libpaho-mqtt3cs) required hand-rolled reconnect
+# threads that kept racing paho's internal state and crashing.
+DEPS=-lyasdimaster -lcjson -lpaho-mqtt3a
 
 yasdi2mqtt: $(SRC)
 	$(CC) -o yasdi2mqtt $(SRC) $(CFLAGS) $(DEPS)

@@ -1,8 +1,12 @@
+#define _GNU_SOURCE // for pthread_setattr_default_np
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <pthread.h>
 #include <cjson/cJSON.h>
 #include "yasdi_handler.h"
 #include "mqtt_client.h"
@@ -10,6 +14,13 @@
 
 #define HA_DISCOVERY_PREFIX_ENV "MQTT_DISCOVERY_PREFIX"
 #define HA_DISCOVERY_PREFIX_DEFAULT "homeassistant"
+
+/*
+ * musl (alpine) creates threads with a 128 KiB stack by default (glibc: 8 MiB).
+ * yasdi's async device detection thread overflows that stack and crashes
+ * silently, so raise the process-wide default before any threads are spawned.
+ */
+#define THREAD_STACK_SIZE (8 * 1024 * 1024)
 
 char *get_required_env(const char *name);
 void new_values_cb(struct device_value_t *values);
@@ -21,9 +32,32 @@ bool mqtt_set_enabled = false;
 char *ha_discovery_prefix;
 bool mqtt_client_ready = false;
 
+static void raise_default_thread_stack_size()
+{
+    pthread_attr_t attr;
+    int status = pthread_attr_init(&attr);
+    if (status != 0)
+    {
+        log_warn("Unable to initialize thread attributes (status: %d)", status);
+        return;
+    }
+
+    pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE);
+    status = pthread_setattr_default_np(&attr);
+    pthread_attr_destroy(&attr);
+
+    if (status != 0)
+        log_warn("Unable to raise default thread stack size to %d bytes (status: %d)", THREAD_STACK_SIZE, status);
+    else
+        log_info("Default thread stack size raised to %d bytes", THREAD_STACK_SIZE);
+}
+
 int main(int argc, char **argv)
 {
     log_set_level(LOG_INFO);
+
+    // Before paho/yasdi spawn any threads: bigger default stacks for musl
+    raise_default_thread_stack_size();
 
     char *yasdi_config = get_required_env("YASDI_CONFIG");
     DWORD yasdi_max_device_count = strtoul(get_required_env("YASDI_MAX_DEVICE_COUNT"), NULL, 10);
@@ -76,7 +110,8 @@ int main(int argc, char **argv)
         log_fatal("Unable to initialize mqtt_client");
         return -1;
     }
-    mqtt_client_ready = true;
+    // mqtt_client_ready is set by mqtt_client once the connection is actually
+    // established, so discovery publishes can't race a pending connect
 
     if (!yh_init(yasdi_config, yasdi_max_device_count, yasdi_update_interval))
     {
@@ -104,8 +139,8 @@ char *get_required_env(const char *name)
 
 void new_values_cb(struct device_value_t *values)
 {
-    char topic[11];
-    sprintf(topic, "%u", values->device_sn);
+    char topic[24];
+    snprintf(topic, sizeof(topic), "%lu", (unsigned long)values->device_sn);
     char *json = cJSON_PrintUnformatted(values->json);
 
     mqtt_send(topic, json);

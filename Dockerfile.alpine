@@ -1,7 +1,5 @@
 FROM alpine:latest AS build
 
-COPY . /yasdi2mqtt
-
 RUN apk add --no-cache git gcc musl-dev make cmake openssl-dev cjson-dev paho-mqtt-c-dev
 RUN ln -s termios.h /usr/include/termio.h
 
@@ -15,6 +13,7 @@ RUN cd yasdi/projects/generic-cmake/build && cmake -D YASDI_DEBUG_OUTPUT=0 .. &&
 
 # Build yasdi2mqtt
 ENV LIBRARY_PATH="/target/usr/local/lib" LD_LIBRARY_PATH="/target/usr/local/lib" C_INCLUDE_PATH="/target/usr/local/include"
+COPY . /yasdi2mqtt
 RUN cd yasdi2mqtt && make YASDI_PATH=../yasdi && make YASDI_PATH=../yasdi DESTDIR=/target/usr/local/bin install
 
 
