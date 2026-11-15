@@ -128,12 +128,13 @@ docker run \
 | MQTT_USER              | *Optional*                                                                                                                                                                    | johndoe                   |
 | MQTT_PASSWORD          | *Optional*                                                                                                                                                                    | sEcReT                    |
 | MQTT_SET_ENABLED       | *Optional*<br><br>Set to `1` to enable writing parameter channels via MQTT (see [Parameter Read/Write](#parameter-readwrite) below). *Disabled by default.*                    | 0                         |
+| MQTT_SET_ALLOW         | *Optional*<br><br>Comma-separated list of channels that may be **written** via MQTT, e.g. `GdManStr,WMaxAstEins`. A `set` for any other channel is refused with an error on the `result` topic. Reading (`get`) is not restricted. *Unset: every channel may be written.* | GdManStr                  |
 | MQTT_DISCOVERY_PREFIX  | *Optional*<br><br>MQTT prefix used for the Home Assistant discovery messages.                                                                                                 | homeassistant             |
 | LOG_LEVEL              | *Optional*<br><br>Set `0` to enable debug output                                                                                                                              | 0                         |
 
 ## Parameter Read/Write
 
-Besides publishing spot values, `yasdi2mqtt` can read and write parameter channels of detected devices via MQTT. Writing is disabled by default and has to be enabled by setting `MQTT_SET_ENABLED=1`. When a request is processed, a result is published on the corresponding `result` or `get` topic (`OK` or an error description).
+Besides publishing spot values, `yasdi2mqtt` can read and write parameter channels of detected devices via MQTT. Writing is disabled by default and has to be enabled by setting `MQTT_SET_ENABLED=1`. Once enabled, any MQTT client with access to the broker can write any parameter; to limit writes to the channels you actually use, set `MQTT_SET_ALLOW` (e.g. `MQTT_SET_ALLOW=GdManStr`). When a request is processed, a result is published on the corresponding `result` or `get` topic (`OK` or an error description).
 
 For a device with serial number `<device_sn>` and channel `<channel>` (e.g. `WMaxAstEins`), the following topics are available:
 

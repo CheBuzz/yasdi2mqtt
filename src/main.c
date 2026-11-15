@@ -29,6 +29,30 @@ void discovery_cb(DWORD device_sn, struct param_channel_info_t *info);
 void publish_discovery(DWORD device_sn);
 
 bool mqtt_set_enabled = false;
+// Optional comma-separated list of channels that may be written via MQTT (MQTT_SET_ALLOW).
+// Unset or empty: every channel may be written (when MQTT_SET_ENABLED=1).
+static const char *mqtt_set_allow = NULL;
+
+static bool set_allowed(const char *channel)
+{
+    if (mqtt_set_allow == NULL || mqtt_set_allow[0] == '\0')
+        return true;
+    if (channel == NULL)
+        return false;
+    size_t n = strlen(channel);
+    const char *p = mqtt_set_allow;
+    while (*p)
+    {
+        const char *e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == n && strncmp(p, channel, n) == 0)
+            return true;
+        if (!e)
+            break;
+        p = e + 1;
+    }
+    return false;
+}
 char *ha_discovery_prefix;
 bool mqtt_client_ready = false;
 
@@ -70,6 +94,7 @@ int main(int argc, char **argv)
     char *mqtt_password = getenv("MQTT_PASSWORD");
 
     mqtt_set_enabled = getenv("MQTT_SET_ENABLED") != NULL && atoi(getenv("MQTT_SET_ENABLED")) != 0;
+    mqtt_set_allow = getenv("MQTT_SET_ALLOW");
     ha_discovery_prefix = getenv(HA_DISCOVERY_PREFIX_ENV);
     if (ha_discovery_prefix == NULL)
         ha_discovery_prefix = HA_DISCOVERY_PREFIX_DEFAULT;
@@ -103,6 +128,7 @@ int main(int argc, char **argv)
     log_info("Configuration | MQTT_USER = %s", mqtt_user);
     log_info("Configuration | MQTT_PASSWORD = %s", mqtt_password);
     log_info("Configuration | MQTT_SET_ENABLED = %d", mqtt_set_enabled);
+    log_info("Configuration | MQTT_SET_ALLOW = %s", (mqtt_set_allow && mqtt_set_allow[0]) ? mqtt_set_allow : "(all channels)");
     log_info("Configuration | HA_DISCOVERY_PREFIX = %s", ha_discovery_prefix);
 
     if (!mqtt_init(mqtt_server, mqtt_port, mqtt_ssl_cert, mqtt_user, mqtt_password, mqtt_topic_prefix, mqtt_qos_level, mqtt_client_id))
@@ -166,8 +192,16 @@ void set_request_cb(const char *sn, const char *action, const char *channel, con
         return;
     }
 
-    if (strcmp(action, "set") == 0)
+    if (strcmp(action, "set") == 0 && !set_allowed(channel))
     {
+        log_warn("Refused set request for %s/%s: channel is not in MQTT_SET_ALLOW", sn, channel);
+        snprintf(topic, sizeof(topic), "%s/result/%s", sn, channel);
+        snprintf(result, sizeof(result), "ERROR: %s is not in MQTT_SET_ALLOW", channel);
+        mqtt_send(topic, result);
+    }
+    else if (strcmp(action, "set") == 0)
+    {
+        log_info("Writing %s/%s = %s", sn, channel, payload);
         bool ok = yh_set_value(device_sn, channel, payload);
         snprintf(topic, sizeof(topic), "%s/result/%s", sn, channel);
         snprintf(result, sizeof(result), ok ? "OK" : "ERROR: channel was not written (see logs for status)");
